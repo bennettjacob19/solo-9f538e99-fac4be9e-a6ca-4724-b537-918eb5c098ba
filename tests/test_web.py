@@ -89,3 +89,72 @@ def test_unknown_round_renders_notice(client):
     assert response.status_code == 200
     assert "无法显示排空轮次" in response.text
     assert "不存在" in response.text
+
+
+def test_index_offers_crash_log_capture(client):
+    page = client.get("/").text
+    assert "抓下次重启日志" in page
+    assert "命名空间" in page
+
+    page = client.get("/?ns=shop&pod=web-0").text
+    assert 'name="container"' in page
+    assert "开始抓取" in page
+
+
+def test_arm_capture_and_show_captured_log(client, sim):
+    response = client.post(
+        "/captures",
+        data={"namespace": "shop", "pod": "web-0", "container": "app", "delay_seconds": "0"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    location = response.headers["location"]
+    capture_id = location.rsplit("capture=", 1)[-1]
+    assert f"capture={capture_id}" in location
+
+    sim.post(
+        "/api/sim/pods/shop/web-0/crash",
+        json={"container": "app", "text": "panic: disk full", "reason": "Error", "exit_code": 2},
+    )
+
+    import time
+
+    payload = {}
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        payload = client.get(f"/api/captures/{capture_id}").json()
+        if payload["state"] not in ("waiting", "reading"):
+            break
+        time.sleep(0.05)
+    assert payload["state"] == "captured"
+    assert "panic: disk full" in payload["logs"]
+    assert payload["exit_reason"] == "Error"
+
+    page = client.get(f"/captures/{capture_id}").text
+    assert "已抓到本次退出的日志" in page
+    assert "panic: disk full" in page
+    assert "退出原因" in page
+
+
+def test_capture_form_validation_error_is_shown(client):
+    response = client.post(
+        "/captures",
+        data={"namespace": "shop", "pod": "", "container": "", "delay_seconds": "0"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert "capture_error" in response.headers["location"]
+
+
+def test_drain_stays_usable_while_capture_waits(client, sim):
+    """A waiting capture must not block the drain controls."""
+    response = client.post(
+        "/captures",
+        data={"namespace": "shop", "pod": "web-0", "container": "app", "delay_seconds": "0"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    round_id = start(client)
+    assert round_id
+    page = client.get(f"/drain/{round_id}").text
+    assert "本轮要驱逐的 Pod" in page

@@ -24,7 +24,13 @@ from pathlib import Path
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
-from .models import NodeInfo, Pod, PodBudget
+from .models import (
+    ContainerSnapshot,
+    NodeInfo,
+    Pod,
+    PodBudget,
+    PodContainers,
+)
 
 
 class KubeError(RuntimeError):
@@ -300,11 +306,181 @@ class KubeClient:
                 f"读取 Pod {namespace}/{name} 失败: {exc.status} {exc.reason}"
             ) from exc
 
+    # -- crash-log capture -------------------------------------------------
+    @staticmethod
+    def _last_terminated(container: client.V1ContainerStatus) -> tuple[str, str, int | None, str]:
+        """Container ID / reason / exit code / message of the last exited instance."""
+        last_state = getattr(container, "last_state", None)
+        terminated = getattr(last_state, "terminated", None) if last_state else None
+        if terminated is None:
+            return "", "", None, ""
+        return (
+            terminated.container_id or "",
+            terminated.reason or "",
+            terminated.exit_code,
+            terminated.message or "",
+        )
+
+    def list_containers(self, namespace: str, name: str) -> PodContainers | None:
+        """Read a Pod's identity and its ordinary (``spec.containers``) names.
+
+        Returns ``None`` when the Pod does not exist.  Ephemeral and init
+        containers are deliberately excluded: the UI offers "normal" containers
+        for crash-log capture.
+        """
+        try:
+            pod = self.core.read_namespaced_pod(name, namespace)
+        except ApiException as exc:
+            if exc.status == 404:
+                return None
+            raise KubeError(
+                f"读取 Pod {namespace}/{name} 失败: {exc.status} {exc.reason}"
+            ) from exc
+        return PodContainers(
+            namespace=namespace,
+            name=name,
+            uid=pod.metadata.uid,
+            node=pod.spec.node_name or "",
+            containers=tuple(
+                container.name for container in (pod.spec.containers or [])
+            ),
+        )
+
+    def container_snapshot(
+        self, namespace: str, name: str, container: str
+    ) -> ContainerSnapshot | None:
+        """Read UID, restart count and last-exited container ID in one call.
+
+        ``None`` means the Pod no longer exists.  A missing container or a
+        container that has never exited yields an empty ``last_container_id``.
+        """
+        try:
+            pod = self.core.read_namespaced_pod(name, namespace)
+        except ApiException as exc:
+            if exc.status == 404:
+                return None
+            raise KubeError(
+                f"读取 Pod {namespace}/{name} 失败: {exc.status} {exc.reason}"
+            ) from exc
+        return self._snapshot_from_pod(pod, container)
+
+    @staticmethod
+    def _snapshot_from_pod(pod: client.V1Pod, container: str) -> ContainerSnapshot:
+        statuses = (pod.status.container_statuses or []) if pod.status else []
+        match = next((item for item in statuses if item.name == container), None)
+        if match is None:
+            return ContainerSnapshot(
+                pod_uid=pod.metadata.uid or "",
+                restart_count=0,
+                last_container_id="",
+                last_reason="",
+                last_exit_code=None,
+                last_message="",
+            )
+        container_id, reason, exit_code, message = KubeClient._last_terminated(match)
+        return ContainerSnapshot(
+            pod_uid=pod.metadata.uid or "",
+            restart_count=match.restart_count or 0,
+            last_container_id=container_id,
+            last_reason=reason,
+            last_exit_code=exit_code,
+            last_message=message,
+        )
+
+    def previous_logs(
+        self,
+        namespace: str,
+        name: str,
+        container: str,
+        tail_lines: int,
+    ) -> str:
+        """Tail of the *previous* container instance's log.
+
+        ``previous=True`` makes the API server return the log of the instance
+        that already exited.  That is the only place a crash message survives
+        once the container has restarted.  ``tailLines`` is applied server
+        side, so a large log is never transferred in full.
+        """
+        try:
+            data = self.core.read_namespaced_pod_log(
+                name,
+                namespace,
+                container=container,
+                previous=True,
+                tail_lines=tail_lines,
+            )
+        except ApiException as exc:
+            if exc.status == 404:
+                raise KubeError(
+                    f"Pod {namespace}/{name} 不存在，无法读取 previous 日志"
+                ) from exc
+            if exc.status == 400:
+                raise KubeError(
+                    f"{namespace}/{name} 容器 {container} 没有上一次退出的实例: "
+                    f"{_status_message(exc)}"
+                ) from exc
+            raise KubeError(
+                f"读取 {namespace}/{name} 容器 {container} 的 previous 日志失败: "
+                f"{exc.status} {_status_message(exc)}"
+            ) from exc
+        if isinstance(data, bytes):
+            return data.decode("utf-8", errors="replace")
+        return data or ""
+
     def list_budgets(self) -> list[client.V1PodDisruptionBudget]:
         try:
             return self.policy.list_pod_disruption_budget_for_all_namespaces().items
         except ApiException as exc:
             raise KubeError(f"读取 PDB 失败: {exc.status} {exc.reason}") from exc
+
+    # -- listings for the crash-log picker ---------------------------------
+    def list_namespaces(self) -> list[str]:
+        try:
+            names = [
+                item.metadata.name for item in self.core.list_namespace().items
+            ]
+        except ApiException as exc:
+            raise KubeError(
+                f"读取命名空间失败: {exc.status} {_status_message(exc)}"
+            ) from exc
+        return sorted(name for name in names if name)
+
+    def list_pods_in_namespace(
+        self, namespace: str, limit: int = 500
+    ) -> list[PodContainers]:
+        """Pods in one namespace with their ordinary container names.
+
+        Every phase is included: a Failed pod still has a ``previous`` log and
+        can be exactly what an operator wants to read.
+        """
+        items: list[client.V1Pod] = []
+        token: str | None = None
+        try:
+            while True:
+                page = self.core.list_namespaced_pod(
+                    namespace, limit=limit, _continue=token
+                )
+                items.extend(page.items or [])
+                token = page.metadata._continue if page.metadata else None
+                if not token:
+                    break
+        except ApiException as exc:
+            raise KubeError(
+                f"读取命名空间 {namespace} 的 Pod 失败: "
+                f"{exc.status} {_status_message(exc)}"
+            ) from exc
+        return [
+            PodContainers(
+                namespace=namespace,
+                name=pod.metadata.name,
+                uid=pod.metadata.uid or "",
+                node=pod.spec.node_name or "",
+                containers=tuple(
+                    container.name for container in (pod.spec.containers or [])
+                ),
+            )
+            for pod in items
+        ]
 
     # -- writes ------------------------------------------------------------
     def cordon(self, node: str) -> None:

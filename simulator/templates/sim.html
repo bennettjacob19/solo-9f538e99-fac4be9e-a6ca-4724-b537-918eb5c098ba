@@ -28,6 +28,8 @@
     button { font:inherit; font-size:12px; padding:5px 10px; border-radius:7px; border:1px solid var(--line); background:#1b2842; color:var(--text); cursor:pointer; }
     button:hover { border-color:var(--accent); }
     button.primary { background:#20457f; border-color:#2d5fa8; }
+    textarea { font:inherit; font-size:12px; width:100%; background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:7px; padding:6px 8px; }
+    select { font:inherit; font-size:12px; background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:7px; padding:4px 8px; }
     input { font:inherit; font-size:12px; width:80px; background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:7px; padding:4px 8px; }
     .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
     .hint { font-size:12px; color:var(--muted); }
@@ -59,10 +61,36 @@
     <section class="panel">
       <h2>Pod</h2>
       <table>
-        <thead><tr><th>Pod</th><th>节点</th><th>归属</th><th>状态</th><th>同名替换 / 操作</th></tr></thead>
+        <thead><tr><th>Pod</th><th>节点</th><th>归属</th><th>状态</th><th>重启 / 容器日志演练</th></tr></thead>
         <tbody id="pods"></tbody>
       </table>
-      <p class="hint">“同名替换”会删除当前对象并以同名新 UID 重建，用于演练驱逐与重建之间的竞争。</p>
+      <p class="hint">
+        “同名替换”会删除当前对象并以同名新 UID 重建，用于演练驱逐与重建之间的竞争。
+        “重启容器”会把填写的文字作为刚退出实例的日志保存，重启次数加一，下一次 previous 日志读取即可取到这段文字。
+        “日志延迟”让该 Pod 的日志读取变慢，便于在读取期间再次重启。
+      </p>
+    </section>
+
+    <section class="panel">
+      <h2>容器崩溃演练</h2>
+      <div class="row">
+        <select id="crash-target" onchange="syncCrashTarget()"></select>
+        <input id="crash-container" list="container-options" placeholder="容器名" style="width:120px">
+        <datalist id="container-options"></datalist>
+        <input id="crash-reason" placeholder="退出原因" value="Error" style="width:110px">
+        <input id="crash-code" type="number" value="1" style="width:70px" title="退出码">
+        <button class="primary" onclick="crashContainer()">重启容器</button>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <textarea id="crash-text" rows="4" placeholder="写入刚退出实例的日志，例如：&#10;panic: connection refused&#10;goroutine 1 [running]: ..."></textarea>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <label class="hint">日志读取延迟（毫秒）</label>
+        <input id="log-delay" type="number" min="0" max="60000" step="500" value="0" style="width:100px">
+        <button onclick="setLogDelay()">应用延迟</button>
+        <span class="hint">设置后再次重启容器，可在值班台等待读取期间制造第二次重启。</span>
+      </div>
+      <p class="hint" id="crash-hint">先在下方或值班台选好目标，填入文字后点“重启容器”。</p>
     </section>
 
     <section class="panel">
@@ -97,6 +125,7 @@ function badge(text, tone) { return `<span class="badge ${tone}">${text}</span>`
 
 async function load() {
   const state = await (await fetch('/api/sim/state')).json();
+  simPods = state.pods || [];
   document.getElementById('nodes').innerHTML = state.nodes.map(n => `
     <tr>
       <td class="mono">${n.name}</td>
@@ -111,16 +140,32 @@ async function load() {
     const readyBtn = p.terminating ? '' :
       `<button onclick="act('/api/sim/pods/${id}/ready', {ready: ${!p.ready}})">${p.ready ? '置为未就绪' : '置为就绪'}</button>`;
     const exitBtn = p.terminating ? `<button onclick="act('/api/sim/pods/${id}/exit', {})">令其退出</button>` : '';
+    const restarts = Object.entries(p.restarts || {}).map(([c, n]) => `${c}:${n}`).join(' · ');
     return `<tr>
       <td class="mono">${p.namespace}/${p.name}<div class="hint mono">UID ${p.uid.slice(0,8)}</div></td>
       <td class="mono">${p.node}</td>
       <td>${owner}</td>
-      <td>${st}</td>
+      <td>${st}<div class="hint mono">重启 ${restarts || '-'}</div></td>
       <td><div class="row">${readyBtn}${exitBtn}
         <button onclick="act('/api/sim/pods/${id}/replace', {node: prompt('重建到哪个节点？', '${p.node}') || '${p.node}'})">同名替换</button>
+        <button onclick="pickTarget('${id}')">选为崩溃目标</button>
       </div></td>
     </tr>`;
   }).join('');
+
+  const current = document.getElementById('crash-target').value;
+  const podList = state.pods.map(p => {
+    const id = p.namespace + '/' + p.name;
+    return `<option value="${id}" ${id === current ? 'selected' : ''}>${id}</option>`;
+  }).join('');
+  const target = document.getElementById('crash-target');
+  target.innerHTML = podList;
+  if (target.value !== current) target.value = current;
+  syncCrashTarget();
+  const selected = simPods.find(p => (p.namespace + '/' + p.name) === document.getElementById('crash-target').value);
+  if (selected && document.getElementById('log-delay').value === '0' && selected.log_delay_ms) {
+    document.getElementById('log-delay').value = selected.log_delay_ms;
+  }
 
   document.getElementById('budgets').innerHTML = state.budgets.map(b => {
     const id = b.namespace + '/' + b.name;
@@ -150,6 +195,49 @@ async function updateBudget(id) {
   const mode = document.getElementById('mode-' + id).value;
   const value = parseInt(document.getElementById('budget-' + id).value, 10);
   await act('/api/sim/budgets/' + id, {[mode]: value});
+}
+
+let simPods = [];
+
+function pickTarget(id) {
+  document.getElementById('crash-target').value = id;
+  syncCrashTarget();
+  document.getElementById('crash-text').focus();
+}
+
+function syncCrashTarget() {
+  const id = document.getElementById('crash-target').value;
+  const pod = simPods.find(p => (p.namespace + '/' + p.name) === id);
+  if (!pod) return;
+  const containerInput = document.getElementById('crash-container');
+  document.getElementById('container-options').innerHTML =
+    (pod.containers || []).map(c => `<option value="${c}">`).join('');
+  if (!(pod.containers || []).includes(containerInput.value) && pod.containers && pod.containers.length) {
+    containerInput.value = pod.containers[0];
+  }
+  document.getElementById('crash-hint').textContent =
+    `目标 ${id} · 容器 ${(pod.containers || []).join('、')} · 当前重启次数 ` +
+    Object.entries(pod.restarts || {}).map(([c, n]) => `${c}:${n}`).join(' · ') +
+    (pod.log_delay_ms ? ` · 日志延迟 ${pod.log_delay_ms}ms` : '');
+}
+
+async function crashContainer() {
+  const id = document.getElementById('crash-target').value;
+  if (!id) return;
+  const body = {
+    container: document.getElementById('crash-container').value,
+    text: document.getElementById('crash-text').value,
+    reason: document.getElementById('crash-reason').value || 'Error',
+    exit_code: parseInt(document.getElementById('crash-code').value, 10) || 1,
+  };
+  await act('/api/sim/pods/' + id + '/crash', body);
+}
+
+async function setLogDelay() {
+  const id = document.getElementById('crash-target').value;
+  if (!id) return;
+  const delay_ms = parseInt(document.getElementById('log-delay').value, 10) || 0;
+  await act('/api/sim/pods/' + id + '/log-delay', {delay_ms});
 }
 
 load();

@@ -22,6 +22,7 @@ or let an evicted pod finish terminating.
 from __future__ import annotations
 
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -60,6 +61,15 @@ class SimPod:
     terminating: bool = False
     deletion_timestamp: str | None = None
     resource_version: int = 1
+    containers: list[str] = field(default_factory=lambda: ["app"])
+    # Crash-loop state, per container name.  ``restarts`` is the API's
+    # restartCount, ``last`` describes the last exited instance (its container
+    # ID and log).  ``current`` is the running instance's buffer.
+    restarts: dict[str, int] = field(default_factory=dict)
+    last: dict[str, dict[str, Any]] = field(default_factory=dict)
+    current: dict[str, list[str]] = field(default_factory=dict)
+    current_ids: dict[str, str] = field(default_factory=dict)
+    log_delay_ms: int = 0
 
     @property
     def key(self) -> tuple[str, str]:
@@ -68,6 +78,35 @@ class SimPod:
     @property
     def healthy(self) -> bool:
         return self.phase == "Running" and self.ready and not self.terminating
+
+    def container_id(self, container: str) -> str:
+        if container not in self.current_ids:
+            self.current_ids[container] = _new_uid()
+        return f"containerd://{self.current_ids[container]}"
+
+    def crash(self, container: str, text: str, reason: str, exit_code: int) -> dict[str, Any]:
+        """Exit the running instance and restart it, keeping the exit log.
+
+        The next ``previous`` log read returns exactly ``text``; the running
+        instance starts with an empty log and a new container ID.
+        """
+        lines = text.splitlines()
+        exited_id = self.container_id(container)
+        self.last[container] = {
+            "container_id": exited_id,
+            "reason": reason,
+            "exit_code": exit_code,
+            "message": (lines[0] if lines else "")[:200],
+            "logs": text,
+        }
+        self.restarts[container] = self.restarts.get(container, 0) + 1
+        # A fresh running instance: new container ID, empty log buffer.
+        self.current[container] = []
+        self.current_ids[container] = _new_uid()
+        self.resource_version += 1
+        self.ready = True
+        self.phase = "Running"
+        return self.last[container]
 
 
 @dataclass
@@ -230,13 +269,52 @@ class ClusterState:
                 "kubernetes.io/config.mirror": _new_uid(),
                 "kubernetes.io/config.source": "file",
             }
+        statuses = []
+        for container in pod.containers:
+            last = pod.last.get(container)
+            state: dict[str, Any] = (
+                {"running": {"startedAt": "2026-01-01T00:00:00Z"}}
+                if pod.healthy
+                else {"waiting": {"reason": "ContainerCreating"}}
+            )
+            statuses.append(
+                {
+                    "name": container,
+                    "ready": pod.healthy,
+                    "restartCount": pod.restarts.get(container, 0),
+                    "image": f"registry.local/{container}:1.0",
+                    "imageID": "registry.local/"
+                    + container
+                    + "@sha256:"
+                    + ("0" * 64),
+                    "containerID": pod.container_id(container),
+                    "started": pod.healthy,
+                    "state": state,
+                    "lastState": (
+                        {
+                            "terminated": {
+                                "containerID": last["container_id"],
+                                "reason": last["reason"],
+                                "exitCode": last["exit_code"],
+                                "message": last["message"],
+                                "finishedAt": "2026-01-01T00:00:00Z",
+                            }
+                        }
+                        if last
+                        else {}
+                    ),
+                }
+            )
         return {
             "apiVersion": "v1",
             "kind": "Pod",
             "metadata": metadata,
             "spec": {
                 "nodeName": pod.node,
-                "containers": [{"name": "app", "image": "registry.local/app:1.0"}],
+                "containers": [
+                    {"name": container, "image": f"registry.local/{container}:1.0"}
+                    for container in pod.containers
+                ],
             },
             "status": {
                 "phase": pod.phase,
@@ -246,19 +324,7 @@ class ClusterState:
                         "status": "True" if pod.healthy else "False",
                     }
                 ],
-                "containerStatuses": [
-                    {
-                        "name": "app",
-                        "ready": pod.healthy,
-                        "restartCount": 0,
-                        "image": "registry.local/app:1.0",
-                        "imageID": "registry.local/app@sha256:"
-                        + ("0" * 64),
-                        "containerID": f"containerd://{pod.uid[:16]}",
-                        "started": True if pod.healthy else False,
-                        "state": {"running": {}} if pod.healthy else {"waiting": {"reason": "ContainerCreating"}},
-                    }
-                ],
+                "containerStatuses": statuses,
             },
         }
 
@@ -409,6 +475,42 @@ def list_pods(fieldSelector: str | None = None, labelSelector: str | None = None
     }
 
 
+@app.get("/api/v1/namespaces")
+def list_namespaces() -> dict[str, Any]:
+    with STATE.lock:
+        names = sorted({namespace for namespace, _ in STATE.pods})
+    return {
+        "apiVersion": "v1",
+        "kind": "NamespaceList",
+        "metadata": {"resourceVersion": "1"},
+        "items": [
+            {
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {"name": name, "uid": f"ns-{name}"},
+            }
+            for name in names
+        ],
+    }
+
+
+@app.get("/api/v1/namespaces/{namespace}/pods")
+def list_pods_in_namespace(namespace: str, fieldSelector: str | None = None) -> dict[str, Any]:
+    with STATE.lock:
+        items = [
+            STATE.pod_json(pod)
+            for pod in STATE.pods.values()
+            if pod.namespace == namespace
+            and _field_selector_matches(pod, fieldSelector or "")
+        ]
+    return {
+        "apiVersion": "v1",
+        "kind": "PodList",
+        "metadata": {"resourceVersion": "1"},
+        "items": items,
+    }
+
+
 @app.get("/api/v1/namespaces/{namespace}/pods/{name}")
 def read_pod(namespace: str, name: str) -> Response:
     with STATE.lock:
@@ -418,6 +520,55 @@ def read_pod(namespace: str, name: str) -> Response:
                 404, "NotFound", f'pods "{name}" not found in namespace "{namespace}"'
             )
         return JSONResponse(STATE.pod_json(pod))
+
+
+@app.get("/api/v1/namespaces/{namespace}/pods/{name}/log")
+def read_pod_log(
+    namespace: str,
+    name: str,
+    container: str | None = None,
+    previous: str | None = None,
+    tailLines: int | None = None,
+    limitBytes: int | None = None,
+) -> Response:
+    """Container log endpoint; ``previous=true`` returns the last exit's log.
+
+    The simulator keeps the exited instance's log even after the container
+    restarted, exactly like a real kubelet's ``previous`` log.  A read delay
+    can be configured per Pod so an operator can restart again *while* the
+    log is being read.
+    """
+    with STATE.lock:
+        pod = _find_pod(namespace, name)
+        if pod is None:
+            return status_response(
+                404, "NotFound", f'pods "{name}" not found in namespace "{namespace}"'
+            )
+        container = container or (pod.containers[0] if pod.containers else "")
+        if container not in pod.containers:
+            return status_response(
+                404, "NotFound", f'container "{container}" not found in pod "{name}"'
+            )
+        wants_previous = str(previous or "").lower() in ("1", "true", "yes")
+        delay_ms = pod.log_delay_ms
+        if wants_previous:
+            last = pod.last.get(container)
+            if last is None:
+                return status_response(
+                    400,
+                    "BadRequest",
+                    f'previous terminated container "{container}" in pod "{name}" not found',
+                )
+            text = last["logs"]
+        else:
+            text = "\n".join(pod.current.get(container, []))
+    if delay_ms:
+        time.sleep(delay_ms / 1000.0)
+    if tailLines is not None and tailLines >= 0:
+        lines = text.splitlines()
+        if len(lines) > tailLines:
+            text = "\n".join(lines[-tailLines:]) + "\n"
+    return Response(content=text, media_type="text/plain; charset=utf-8")
 
 
 @app.get("/api/v1/pods/{name}")
@@ -561,6 +712,20 @@ def sim_state() -> dict[str, Any]:
                     "phase": pod.phase,
                     "terminating": pod.terminating,
                     "healthy": pod.healthy,
+                    "containers": pod.containers,
+                    "restarts": {
+                        container: pod.restarts.get(container, 0)
+                        for container in pod.containers
+                    },
+                    "last_exit": {
+                        container: {
+                            "container_id": last["container_id"],
+                            "reason": last["reason"],
+                            "exit_code": last["exit_code"],
+                        }
+                        for container, last in pod.last.items()
+                    },
+                    "log_delay_ms": pod.log_delay_ms,
                 }
                 for pod in sorted(pods, key=lambda p: (p.namespace, p.name))
             ],
@@ -619,6 +784,69 @@ async def update_budget(namespace: str, name: str, request: Request) -> Response
         return JSONResponse(STATE.pdb_json(pdb))
 
 
+@app.post("/api/sim/pods/{namespace}/{name}/crash")
+async def crash_container(namespace: str, name: str, request: Request) -> Response:
+    """Exit one container instance and restart it, preserving the exit log.
+
+    The text in the body becomes the log of the instance that exited, so the
+    next ``previous`` log read returns exactly that text.  This is the crash
+    the "抓下次重启日志" capture is meant to pick up.
+    """
+    body: dict[str, Any] = {}
+    if request.headers.get("content-length") not in (None, "0"):
+        body = await request.json()
+    with STATE.lock:
+        pod = _find_pod(namespace, name)
+        if pod is None:
+            return status_response(404, "NotFound", f'pods "{name}" not found')
+        if pod.terminating:
+            return status_response(409, "Conflict", "Pod 正在退出，不能重启容器")
+        container = str(body.get("container") or "")
+        if container not in pod.containers:
+            return status_response(422, "Invalid", f'容器 "{container}" 不属于该 Pod')
+        text = str(body.get("text") or "")
+        if not text.strip():
+            return status_response(422, "Invalid", "需要一段退出日志文本")
+        reason = str(body.get("reason") or "Error")
+        exit_code = int(body.get("exit_code", 1))
+        pod.crash(container, text, reason, exit_code)
+        count = pod.restarts[container]
+        STATE._event(
+            "crash",
+            f"{namespace}/{name} 容器 {container} 第 {count} 次重启"
+            f"（退出原因 {reason}，退出码 {exit_code}）",
+        )
+        return JSONResponse(
+            {
+                "namespace": namespace,
+                "name": name,
+                "container": container,
+                "restart_count": count,
+                "last_exit": pod.last[container],
+            },
+            status_code=201,
+        )
+
+
+@app.post("/api/sim/pods/{namespace}/{name}/log-delay")
+async def set_log_delay(namespace: str, name: str, request: Request) -> Response:
+    """Delay log reads for one Pod so a restart can land mid-read."""
+    body = await request.json()
+    with STATE.lock:
+        pod = _find_pod(namespace, name)
+        if pod is None:
+            return status_response(404, "NotFound", f'pods "{name}" not found')
+        delay_ms = max(0, min(int(body.get("delay_ms", 0)), 60_000))
+        pod.log_delay_ms = delay_ms
+        STATE._event(
+            "log-delay",
+            f"{namespace}/{name} 日志读取延迟设为 {delay_ms} 毫秒",
+        )
+        return JSONResponse(
+            {"namespace": namespace, "name": name, "log_delay_ms": delay_ms}
+        )
+
+
 @app.post("/api/sim/pods/{namespace}/{name}/replace")
 async def replace_pod(namespace: str, name: str, request: Request) -> Response:
     """Re-create the pod under the same name with a new UID.
@@ -645,6 +873,7 @@ async def replace_pod(namespace: str, name: str, request: Request) -> Response:
             owner_kind=old.owner_kind,
             static=old.static,
             ready=ready,
+            containers=list(old.containers),
         )
         STATE.pods[replacement.key] = replacement
         STATE._event(
@@ -694,6 +923,7 @@ async def create_pod(request: Request) -> Response:
             static=bool(body.get("static", False)),
             ready=bool(body.get("ready", True)),
             phase=str(body.get("phase") or "Running"),
+            containers=list(body.get("containers") or ["app"]),
         )
         STATE.pods[pod.key] = pod
         STATE._event("create", f"创建 Pod {namespace}/{name} 于 {node}")

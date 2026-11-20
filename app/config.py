@@ -43,6 +43,7 @@ class Settings:
     kubeconfig: str | None
     context: str | None
     title: str = "节点排空值班台"
+    capture_timeout: float = 30.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -69,6 +70,7 @@ class Settings:
             kubeconfig=os.environ.get("DRAIN_KUBECONFIG") or os.environ.get("KUBECONFIG"),
             context=os.environ.get("DRAIN_KUBE_CONTEXT"),
             title=os.environ.get("DRAIN_TITLE", "节点排空值班台"),
+            capture_timeout=float(os.environ.get("DRAIN_CAPTURE_TIMEOUT", "30")),
         )
 
 

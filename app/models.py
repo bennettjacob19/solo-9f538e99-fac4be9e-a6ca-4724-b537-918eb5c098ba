@@ -115,6 +115,44 @@ class NodeInfo:
     pod_count: int = 0
 
 
+@dataclass(frozen=True)
+class ContainerSnapshot:
+    """One container's restart identity at a single point in time.
+
+    ``last_container_id`` is the container ID recorded in
+    ``status.containerStatuses[].lastState.terminated`` — the ID of the
+    instance that exited most recently.  Together with the Pod UID and the
+    restart count it identifies exactly which exited container a ``previous``
+    log read belongs to.
+    """
+
+    pod_uid: str
+    restart_count: int
+    last_container_id: str
+    last_reason: str
+    last_exit_code: int | None
+    last_message: str
+
+    @property
+    def triple(self) -> tuple[str, int, str]:
+        return (self.pod_uid, self.restart_count, self.last_container_id)
+
+
+@dataclass(frozen=True)
+class PodContainers:
+    """A Pod and the ordinary containers (``spec.containers``) it declares."""
+
+    namespace: str
+    name: str
+    uid: str
+    node: str
+    containers: tuple[str, ...]
+
+    @property
+    def key(self) -> str:
+        return f"{self.namespace}/{self.name}"
+
+
 @dataclass
 class PodStatus:
     """Live status of one Pod object (identified by UID) in a drain round."""

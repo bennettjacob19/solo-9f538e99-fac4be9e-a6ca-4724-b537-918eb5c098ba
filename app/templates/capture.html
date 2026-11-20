@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block content %}
+{% if capture.state.pending %}
+  <meta http-equiv="refresh" content="3">
+{% endif %}
+<section class="panel">
+  <div class="row-split">
+    <h2 class="mono">{{ capture.key }}</h2>
+    <span class="badge {{ capture.state.tone }}">{{ capture.state.label }}</span>
+  </div>
+  <p class="small muted">
+    容器 <span class="mono">{{ capture.container }}</span> ·
+    抓取 <span class="mono">{{ capture.capture_id }}</span><br>
+    开始 {{ capture.created_at }}{% if capture.finished_at %} · 结束 {{ capture.finished_at }}{% endif %}
+    {% if capture.baseline %}<br>
+      基线：Pod UID <span class="mono">{{ capture.baseline.pod_uid[:8] }}</span> ·
+      重启次数 {{ capture.baseline.restart_count }} ·
+      上次退出容器 ID <span class="mono">{{ capture.baseline.last_container_id or '（无）' }}</span>
+    {% endif %}
+    {% if capture.delay_seconds %}<br>日志读取延迟 {{ capture.delay_seconds }} 秒{% endif %}
+  </p>
+
+  {% if capture.state.pending %}
+    <div class="alert info">{{ capture.message }}</div>
+  {% elif capture.state.value == 'captured' %}
+    <div class="alert ok"><strong>已抓到本次退出的日志。</strong>{{ capture.message }}</div>
+    <div class="grid" style="margin-bottom:14px">
+      <div class="stat"><div class="cap">容器 ID</div><div class="mono small">{{ capture.container_id or '（未知）' }}</div></div>
+      <div class="stat"><div class="cap">退出原因</div><div class="mono">{{ capture.exit_reason or '（未知）' }}</div></div>
+      <div class="stat"><div class="cap">退出码</div><div class="mono">{{ capture.exit_code if capture.exit_code is not none else '（未知）' }}</div></div>
+      <div class="stat"><div class="cap">重启次数</div><div class="num">{{ capture.target_restart_count }}</div></div>
+    </div>
+    <pre class="crash-log">{{ capture.logs }}</pre>
+  {% elif capture.state.value == 'timeout' %}
+    <div class="alert warn"><strong>等待超时。</strong>{{ capture.message }}</div>
+  {% elif capture.state.value == 'error' %}
+    <div class="alert error"><strong>API 读取失败。</strong>{{ capture.message }}</div>
+  {% else %}
+    <div class="alert error"><strong>无法确认归属，本次日志已丢弃。</strong>{{ capture.message }}</div>
+  {% endif %}
+
+  <div class="actions" style="margin-top:14px">
+    <a class="button ghost" href="/">返回值班台</a>
+    <a class="button ghost" href="/api/captures/{{ capture.capture_id }}">JSON</a>
+  </div>
+</section>
+
+<section class="panel">
+  <h3>核对记录</h3>
+  {% if capture.checks %}
+    <div class="timeline">
+      {% for check in capture.checks %}<div class="item">{{ check }}</div>{% endfor %}
+    </div>
+  {% else %}
+    <p class="muted">暂无记录。</p>
+  {% endif %}
+</section>
+{% endblock %}

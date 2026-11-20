@@ -4,6 +4,107 @@
 {% if query_error %}
   <div class="alert error"><strong>操作失败：</strong>{{ query_error }}</div>
 {% endif %}
+{% set capture_error = request.query_params.get('capture_error') %}
+{% if capture_error %}
+  <div class="alert error"><strong>无法开始抓取：</strong>{{ capture_error }}</div>
+{% endif %}
+
+<section class="panel" id="crash-capture">
+  <div class="row-split">
+    <h2>抓下次重启日志</h2>
+    <span class="muted small">先选好目标和容器并开始抓取，再去让它崩溃；只取重启次数恰好加一的那一次。</span>
+  </div>
+
+  <form method="get" action="/" class="picker-row" id="capture-picker">
+    <label class="field">
+      <span>命名空间</span>
+      <select name="ns" onchange="document.getElementById('capture-picker').submit()">
+        <option value="">请选择</option>
+        {% for name in namespaces %}
+          <option value="{{ name }}" {% if name == picker_namespace %}selected{% endif %}>{{ name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="field">
+      <span>Pod</span>
+      <select name="pod" {% if not picker_namespace %}disabled{% endif %}
+              onchange="document.getElementById('capture-picker').submit()">
+        <option value="">请选择</option>
+        {% for pod in picker_pods %}
+          <option value="{{ pod.name }}" {% if pod.name == picker_pod %}selected{% endif %}>
+            {{ pod.name }}{% if pod.node %} · {{ pod.node }}{% endif %}
+          </option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="field">
+      <span>普通容器</span>
+      <select name="container" {% if not picker_containers %}disabled{% endif %}>
+        <option value="">请选择</option>
+        {% for name in picker_containers %}
+          <option value="{{ name }}" {% if name == picker_container %}selected{% endif %}>{{ name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="field">
+      <span>读取延迟（秒，可选）</span>
+      <input type="number" name="delay_seconds" min="0" max="30" step="1" value="0" id="capture-delay-input">
+    </label>
+    <button class="primary" type="button" onclick="document.getElementById('capture-form').requestSubmit()"
+            {% if not picker_container %}disabled{% endif %}>开始抓取</button>
+  </form>
+  <p class="small muted" id="delay-note" style="margin:-2px 0 8px">
+    读取延迟会用在“观察到重启次数加一”之后：延迟期间若又发生一次重启，本次日志会被丢弃。
+  </p>
+  {% if picker_error %}
+    <div class="alert warn">读取可抓取的命名空间 / Pod 失败：{{ picker_error }}</div>
+  {% elif not picker_namespace %}
+    <p class="small muted">选择命名空间和 Pod 后，这里会列出除 init / 临时容器之外的普通容器。</p>
+  {% elif not picker_containers %}
+    <p class="small muted">所选 Pod 没有可选中的普通容器。</p>
+  {% endif %}
+
+  <form method="post" action="/captures" id="capture-form">
+    <input type="hidden" name="namespace" value="{{ picker_namespace }}">
+    <input type="hidden" name="pod" value="{{ picker_pod }}">
+    <input type="hidden" name="container" value="{{ picker_container }}">
+    <input type="hidden" name="delay_seconds" id="capture-delay-field" value="0">
+  </form>
+  <p class="small muted" style="margin-bottom:0">
+    开始后从 Kubernetes API 读取 Pod UID、容器重启次数和上次退出的容器 ID；
+    30 秒内重启次数恰好加一才读取 previous 日志末尾 100 行，并在读取前后各核对一次。
+  </p>
+
+  {% for cap in captures %}
+    <div class="capture-row">
+      <div class="row-split">
+        <div>
+          <span class="mono">{{ cap.key }}</span>
+          <span class="muted small">· 容器 {{ cap.container }}</span>
+          <span class="badge {{ cap.state.tone }}">{{ cap.state.label }}</span>
+        </div>
+        <span class="muted small mono">{{ cap.created_at }}</span>
+      </div>
+      <p class="small" style="margin:6px 0">{{ cap.message }}</p>
+      {% if cap.state.pending %}
+        <p class="small muted" style="margin:0">
+          等待期间可以照常排空：抓取在后台进行，不会占用排空操作。
+        </p>
+      {% endif %}
+      {% if cap.state.keeps_logs %}
+        <div class="small muted">
+          容器 ID <span class="mono">{{ cap.container_id or '（未知）' }}</span> ·
+          退出原因 <span class="mono">{{ cap.exit_reason or '（未知）' }}</span>
+          {% if cap.exit_code is not none %} · 退出码 {{ cap.exit_code }}{% endif %}
+        </div>
+        <pre class="crash-log">{{ cap.logs }}</pre>
+      {% endif %}
+      <p class="small" style="margin:6px 0 0">
+        <a href="/captures/{{ cap.capture_id }}">核对记录与详情</a>
+      </p>
+    </div>
+  {% endfor %}
+</section>
 
 <section class="panel">
   <div class="row-split">
@@ -83,4 +184,29 @@
     <p class="muted">还没有排空轮次。</p>
   {% endif %}
 </section>
+
+<script>
+  // The visible picker lives in a GET form (so choosing a namespace reloads
+  // the dependent lists), while the actual POST form is hidden.  Mirror the
+  // current choices into it at submit time.
+  (function () {
+    const picker = document.getElementById('capture-picker');
+    const form = document.getElementById('capture-form');
+    if (!picker || !form) return;
+    function sync() {
+      const values = {
+        namespace: picker.querySelector('[name="ns"]').value,
+        pod: picker.querySelector('[name="pod"]').value,
+        container: picker.querySelector('[name="container"]').value,
+        delay_seconds: picker.querySelector('[name="delay_seconds"]').value || '0',
+      };
+      for (const [key, value] of Object.entries(values)) {
+        const field = form.querySelector(`[name="${key}"]`);
+        if (field) field.value = value;
+      }
+    }
+    picker.addEventListener('change', sync);
+    form.addEventListener('submit', sync);
+  })();
+</script>
 {% endblock %}
